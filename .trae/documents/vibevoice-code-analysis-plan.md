@@ -236,6 +236,40 @@ VibeVoice 是一个前沿的长对话文本转语音（TTS）模型框架，由�
 4. `vibevoice_asr_inference_from_file.py` ASR 推理
 5. 完整推理流水线：文本→分词→模型→扩散→解码→音频
 
+### 文档 13: `13_使用指南：ASR与TTS实践.md`
+**内容要点：**
+1. **TTS（文本转语音）使用指南**
+   - 环境安装与模型下载
+   - 多说话人 TTS 推理（1.5B / 7B 模型）
+     - 从文件推理：`inference_from_file.py` 的参数与用法
+     - Gradio 交互式演示：`gradio_demo.py` 的启动与配置
+     - 说话人语音克隆：voice sample 的准备与使用
+     - 禁用语音克隆（`--disable_prefill`）的场景
+   - 流式 TTS 推理（0.5B 模型）
+     - 预计算语音嵌入（.pt 文件）的使用
+     - 语音预设选择（Carter, Davis, Emma, Frank, Grace, Mike, Samuel）
+     - CFG scale 与 DDPM steps 的调节
+   - 微调模型加载（`--checkpoint_path`）
+   - 中文语音合成的注意事项
+   - 长文本分块策略
+2. **ASR（语音识别）使用指南**
+   - ASR 模型加载与初始化
+   - 从文件进行 ASR 推理：`vibevoice_asr_inference_from_file.py`
+   - ASR Gradio 演示：`vibevoice_asr_gradio_demo.py`
+   - 长音频处理（流式分段编码）
+   - 输入音频格式要求
+3. **TTS + ASR 联合使用场景**
+   - 语音到语音翻译（ASR → 文本 → TTS）
+   - 语音克隆流水线（ASR 提取特征 → TTS 生成新语音）
+   - 多说话人播客生成完整流程
+4. **常见问题与调优**
+   - 中文语音合成的稳定性优化
+   - 背景音乐/音效的触发与控制
+   - 情感控制技巧
+   - 跨语言迁移的使用方式
+   - GPU 内存优化策略
+   - 推理速度与质量的权衡（DDPM steps / CFG scale）
+
 ## 四、实现步骤
 
 1. 创建 `/workspace/ReadCode/` 目录
@@ -256,7 +290,7 @@ VibeVoice 是一个前沿的长对话文本转语音（TTS）模型框架，由�
 
 ## 六、验证步骤
 
-1. 检查 ReadCode 目录下所有 12 个文档是否创建
+1. 检查 ReadCode 目录下所有 13 个文档是否创建
 2. 每个文档内容是否覆盖了计划中的所有要点
 3. 代码引用是否准确（文件路径 + 行号）
 4. Mermaid 图表语法是否正确
