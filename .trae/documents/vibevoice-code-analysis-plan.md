@@ -238,37 +238,164 @@ VibeVoice 是一个前沿的长对话文本转语音（TTS）模型框架，由�
 
 ### 文档 13: `13_使用指南：ASR与TTS实践.md`
 **内容要点：**
-1. **TTS（文本转语音）使用指南**
-   - 环境安装与模型下载
-   - 多说话人 TTS 推理（1.5B / 7B 模型）
-     - 从文件推理：`inference_from_file.py` 的参数与用法
-     - Gradio 交互式演示：`gradio_demo.py` 的启动与配置
-     - 说话人语音克隆：voice sample 的准备与使用
-     - 禁用语音克隆（`--disable_prefill`）的场景
-   - 流式 TTS 推理（0.5B 模型）
-     - 预计算语音嵌入（.pt 文件）的使用
-     - 语音预设选择（Carter, Davis, Emma, Frank, Grace, Mike, Samuel）
-     - CFG scale 与 DDPM steps 的调节
-   - 微调模型加载（`--checkpoint_path`）
-   - 中文语音合成的注意事项
-   - 长文本分块策略
-2. **ASR（语音识别）使用指南**
-   - ASR 模型加载与初始化
-   - 从文件进行 ASR 推理：`vibevoice_asr_inference_from_file.py`
-   - ASR Gradio 演示：`vibevoice_asr_gradio_demo.py`
-   - 长音频处理（流式分段编码）
-   - 输入音频格式要求
-3. **TTS + ASR 联合使用场景**
-   - 语音到语音翻译（ASR → 文本 → TTS）
-   - 语音克隆流水线（ASR 提取特征 → TTS 生成新语音）
-   - 多说话人播客生成完整流程
-4. **常见问题与调优**
-   - 中文语音合成的稳定性优化
-   - 背景音乐/音效的触发与控制
-   - 情感控制技巧
-   - 跨语言迁移的使用方式
-   - GPU 内存优化策略
-   - 推理速度与质量的权衡（DDPM steps / CFG scale）
+1. **环境准备（可运行代码）**
+   - 安装命令：`uv pip install -e .` 或 `pip install -e .`
+   - 模型下载：HuggingFace CLI / 自动下载代码
+   - GPU 与依赖检查脚本
+   ```python
+   import torch
+   print(f"CUDA available: {torch.cuda.is_available()}")
+   print(f"GPU: {torch.cuda.get_device_name(0)}")
+   ```
+
+2. **TTS 多说话人推理（可运行代码）**
+   - 命令行推理方式：
+   ```bash
+   python demo/inference_from_file.py \
+     --model_path vibevoice/VibeVoice-1.5B \
+     --txt_path demo/text_examples/1p_abs.txt \
+     --speaker_names Alice
+   ```
+   - Python API 推理方式（完整可运行代码）：
+   ```python
+   import torch
+   from vibevoice.modular import VibeVoiceForConditionalGenerationInference
+   from vibevoice.processor import VibeVoiceProcessor
+
+   # 加载模型与处理器
+   model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+       "vibevoice/VibeVoice-1.5B", torch_dtype=torch.bfloat16
+   ).cuda()
+   processor = VibeVoiceProcessor.from_pretrained("vibevoice/VibeVoice-1.5B")
+
+   # 准备输入
+   inputs = processor(
+       text="Speaker 1: Hello, welcome to our podcast.",
+       voice_samples=["demo/voices/en-Alice_woman.wav"],
+       return_tensors="pt"
+   ).to("cuda")
+
+   # 生成语音
+   outputs = model.generate(**inputs, tokenizer=processor.tokenizer)
+   audio = outputs.speech_outputs[0]
+
+   # 保存音频
+   processor.save_audio(audio, "output.wav")
+   ```
+   - 多说话人推理（2人对话）：
+   ```python
+   inputs = processor(
+       text="Speaker 1: Hello! Speaker 2: Hi there!",
+       voice_samples=["demo/voices/en-Alice_woman.wav", "demo/voices/en-Carter_man.wav"],
+       return_tensors="pt"
+   ).to("cuda")
+   ```
+   - 禁用语音克隆：
+   ```python
+   inputs = processor(text="Speaker 1: Hello world.", return_tensors="pt").to("cuda")
+   # 不传 voice_samples 即跳过语音预填充
+   ```
+   - 加载微调模型：
+   ```python
+   from vibevoice.modular import load_lora_assets
+   model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+       "vibevoice/VibeVoice-1.5B", torch_dtype=torch.bfloat16
+   ).cuda()
+   load_lora_assets(model, "path/to/checkpoint")
+   ```
+
+3. **TTS 流式推理（可运行代码）**
+   - 命令行方式：
+   ```bash
+   python demo/streaming_inference_from_file.py \
+     --model_path microsoft/VibeVoice-Realtime-0.5B \
+     --txt_path demo/text_examples/1p_vibevoice.txt \
+     --speaker_name Emma \
+     --cfg_scale 1.5 --ddpm_steps 5
+   ```
+   - Python API 流式推理（完整可运行代码）：
+   ```python
+   import torch
+   from vibevoice.modular import VibeVoiceStreamingForConditionalGenerationInference
+   from vibevoice.processor import VibeVoiceStreamingProcessor
+
+   model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+       "microsoft/VibeVoice-Realtime-0.5B", torch_dtype=torch.bfloat16
+   ).cuda()
+   processor = VibeVoiceStreamingProcessor.from_pretrained(
+       "microsoft/VibeVoice-Realtime-0.5B"
+   )
+
+   # 加载预计算语音嵌入
+   voice_embedding = torch.load("demo/voices/streaming_model/en-Emma_woman.pt")
+
+   # 准备输入并生成
+   inputs = processor(
+       text="Hello, this is a streaming test.",
+       voice_embedding=voice_embedding,
+       return_tensors="pt"
+   ).to("cuda")
+   outputs = model.generate(**inputs, tokenizer=processor.tokenizer, cfg_scale=1.5)
+   ```
+
+4. **ASR 语音识别（可运行代码）**
+   - 命令行方式：
+   ```bash
+   python demo/vibevoice_asr_inference_from_file.py \
+     --model_path vibevoice/VibeVoice-1.5B \
+     --audio_path input.wav
+   ```
+   - Python API 推理（完整可运行代码）：
+   ```python
+   import torch
+   from vibevoice.modular import VibeVoiceASRForConditionalGeneration
+   from vibevoice.processor import VibeVoiceASRProcessor
+
+   model = VibeVoiceASRForConditionalGeneration.from_pretrained(
+       "vibevoice/VibeVoice-1.5B", torch_dtype=torch.bfloat16
+   ).cuda()
+   processor = VibeVoiceASRProcessor.from_pretrained("vibevoice/VibeVoice-1.5B")
+
+   # 加载音频并识别
+   inputs = processor(audio_path="input.wav", return_tensors="pt").to("cuda")
+   generated_ids = model.generate(**inputs, max_new_tokens=512)
+   transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)
+   print(transcription)
+   ```
+
+5. **TTS + ASR 联合使用（可运行代码）**
+   - 语音到语音翻译完整流水线：
+   ```python
+   # Step 1: ASR 识别源语音
+   asr_inputs = asr_processor(audio_path="chinese_input.wav", return_tensors="pt").to("cuda")
+   text_ids = asr_model.generate(**asr_inputs, max_new_tokens=512)
+   text = asr_processor.batch_decode(text_ids, skip_special_tokens=True)[0]
+
+   # Step 2: TTS 生成目标语言语音
+   tts_inputs = tts_processor(
+       text=f"Speaker 1: {text}",
+       voice_samples=["demo/voices/en-Alice_woman.wav"],
+       return_tensors="pt"
+   ).to("cuda")
+   outputs = tts_model.generate(**tts_inputs, tokenizer=tts_processor.tokenizer)
+   tts_processor.save_audio(outputs.speech_outputs[0], "translated_output.wav")
+   ```
+   - 多说话人播客生成完整流程代码
+
+6. **Gradio 演示启动（可运行命令）**
+   ```bash
+   # 多说话人 TTS 演示
+   python demo/gradio_demo.py --model_path vibevoice/VibeVoice-1.5B --share
+
+   # ASR 演示
+   python demo/vibevoice_asr_gradio_demo.py --model_path vibevoice/VibeVoice-1.5B --share
+   ```
+
+7. **常见问题与调优（代码示例）**
+   - 中文语音合成优化：使用英文标点、分块策略代码
+   - 推理速度与质量权衡：调整 ddpm_steps / cfg_scale 的代码
+   - GPU 内存优化：`torch.cuda.empty_cache()`、半精度推理代码
+   - 长文本分块处理的 Python 代码示例
 
 ## 四、实现步骤
 
