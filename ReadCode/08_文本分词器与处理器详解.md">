@@ -1,0 +1,575 @@
+
+# 文本分词器与处理器详解
+
+## 一、整体架构
+
+VibeVoice 的文本分词器和处理器层实现了完整的文本 - 语音处理流水线，支持多说话人 TTS 和 ASR 任务。
+
+```mermaid
+graph TB
+    subgraph "输入层"
+        RawText["原始文本/脚本"]
+        RawAudio["原始音频"]
+    end
+    
+    subgraph "处理层"
+        Tokenizer["VibeVoiceTextTokenizer\n文本分词器"]
+        AudioProc["VibeVoiceTokenizerProcessor\n音频处理器"]
+        MainProc["VibeVoiceProcessor\n主处理器"]
+        ASRProc["VibeVoiceASRProcessor\nASR处理器"]
+        StreamingProc["VibeVoiceStreamingProcessor\n流式处理器"]
+    end
+    
+    subgraph "模型层"
+        TTSModel["TTS模型"]
+        ASRModel["ASR模型"]
+        StreamingModel["流式TTS模型"]
+    end
+    
+    RawText --&gt; MainProc
+    RawAudio --&gt; AudioProc
+    MainProc --&gt; Tokenizer
+    MainProc --&gt; AudioProc
+    MainProc --&gt; TTSModel
+    
+    RawAudio --&gt; ASRProc
+    ASRProc --&gt; Tokenizer
+    ASRProc --&gt; AudioProc
+    ASRProc --&gt; ASRModel
+    
+    RawText --&gt; StreamingProc
+    StreamingProc --&gt; Tokenizer
+    StreamingProc --&gt; StreamingModel
+```
+
+## 二、VibeVoiceTextTokenizer - 文本分词器
+
+### 核心功能
+
+在 [`vibevoice/modular/modular_vibevoice_text_tokenizer.py`](file:///workspace/vibevoice/modular/modular_vibevoice_text_tokenizer.py) 中定义，基于 Qwen2 分词器扩展了语音相关的特殊 Token。
+
+### 特殊 Token 定义
+
+| Token 字符串 | 属性名称 | 用途 |
+|-------------|---------|------|
+| `&lt;|vision_start|&gt;` | `speech_start_id` | 标记语音输入/输出的开始 |
+| `&lt;|vision_end|&gt;` | `speech_end_id` | 标记语音输入/输出的结束 |
+| `&lt;|vision_pad|&gt;` | `speech_diffusion_id` | 占位符，每一个对应一帧扩散生成 |
+| `&lt;|endoftext|&gt;` | `eos_id` | 序列结束标记 |
+
+### 代码实现
+
+```python
+class VibeVoiceTextTokenizer(Qwen2Tokenizer):
+    def __init__(self, vocab_file, merges_file, ...):
+        super().__init__(...)
+        self._add_vibevoice_special_tokens()
+    
+    def _add_vibevoice_special_tokens(self):
+        # 添加特殊 Token
+        special_tokens = {
+            "additional_special_tokens": [
+                "&lt;|vision_start|&gt;",
+                "&lt;|vision_end|&gt;", 
+                "&lt;|vision_pad|&gt;"
+            ]
+        }
+        self.add_special_tokens(special_tokens)
+        
+        # 缓存 Token ID
+        self._speech_start_id = self.convert_tokens_to_ids("&lt;|vision_start|&gt;")
+        self._speech_end_id = self.convert_tokens_to_ids("&lt;|vision_end|&gt;")
+        self._speech_diffusion_id = self.convert_tokens_to_ids("&lt;|vision_pad|&gt;")
+        self._eos_id = self.convert_tokens_to_ids('&lt;|endoftext|&gt;')
+```
+
+### 快速版分词器
+
+同时提供 `VibeVoiceTextTokenizerFast` 版本，基于 HuggingFace 快速分词器库：
+
+```python
+class VibeVoiceTextTokenizerFast(Qwen2TokenizerFast):
+    @property
+    def speech_diffusion_id(self) -&gt; int:
+        return self._speech_diffusion_id
+```
+
+### 使用示例
+
+```python
+from vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceTextTokenizer
+
+tokenizer = VibeVoiceTextTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B")
+
+# 编码普通文本
+text = "你好，世界"
+tokens = tokenizer.encode(text)
+
+# 检查特殊 Token ID
+print(f"Speech Start ID: {tokenizer.speech_start_id}")
+print(f"Speech End ID: {tokenizer.speech_end_id}")
+print(f"Speech Diffusion ID: {tokenizer.speech_diffusion_id}")
+```
+
+## 三、AudioNormalizer - 音频归一化
+
+### 设计理念
+
+在 [`vibevoice/processor/vibevoice_tokenizer_processor.py`](file:///workspace/vibevoice/processor/vibevoice_tokenizer_processor.py) 中定义，确保音频输入保持一致的音量水平。
+
+```python
+class AudioNormalizer:
+    def __init__(self, target_dB_FS: float = -25, eps: float = 1e-6):
+        self.target_dB_FS = target_dB_FS
+        self.eps = eps
+    
+    def tailor_dB_FS(self, audio: np.ndarray) -&gt; tuple:
+        # 计算均方根
+        rms = np.sqrt(np.mean(audio**2))
+        # 计算缩放因子
+        scalar = 10 ** (self.target_dB_FS / 20) / (rms + self.eps)
+        normalized_audio = audio * scalar
+        return normalized_audio, rms, scalar
+    
+    def avoid_clipping(self, audio: np.ndarray, scalar: Optional[float] = None) -&gt; tuple:
+        if scalar is None:
+            max_val = np.max(np.abs(audio))
+            if max_val &gt; 1.0:
+                scalar = max_val + self.eps
+            else:
+                scalar = 1.0
+        return audio / scalar, scalar
+    
+    def __call__(self, audio: np.ndarray) -&gt; np.ndarray:
+        # 先调整到目标音量
+        audio, _, _ = self.tailor_dB_FS(audio)
+        # 再防止削波
+        audio, _ = self.avoid_clipping(audio)
+        return audio
+```
+
+### 归一化流程
+
+```mermaid
+graph LR
+    A[原始音频] --&gt; B[计算RMS]
+    B --&gt; C[计算缩放因子]
+    C --&gt; D[缩放到目标dB]
+    D --&gt; E[检查峰值]
+    E --&gt; F{峰值&gt;1.0?}
+    F --&gt;|是| G[再次缩放防止削波]
+    F --&gt;|否| H[输出归一化音频]
+    G --&gt; H
+```
+
+### 音量计算原理
+
+RMS（均方根）计算：
+$$
+\text{RMS} = \sqrt{\frac{1}{N}\sum_{i=1}^N x_i^2}
+$$
+
+dB 转换：
+$$
+\text{dB_FS} = 20 \cdot \log_{10}(\text{RMS})
+$$
+
+目标音量缩放：
+$$
+\text{scalar} = \frac{10^{\text{target_dB_FS}/20}}{\text{RMS} + \epsilon}
+$$
+
+## 四、VibeVoiceTokenizerProcessor - 音频处理器
+
+### 核心功能
+
+在 [`vibevoice/processor/vibevoice_tokenizer_processor.py`](file:///workspace/vibevoice/processor/vibevoice_tokenizer_processor.py) 中定义，负责音频的预处理工作。
+
+### 主要方法
+
+#### 1. 确保单声道
+
+```python
+def _ensure_mono(self, audio: np.ndarray) -&gt; np.ndarray:
+    if len(audio.shape) == 1:
+        return audio
+    elif len(audio.shape) == 2:
+        if audio.shape[0] == 2:  # (2, time)
+            return np.mean(audio, axis=0)
+        elif audio.shape[1] == 2:  # (time, 2)
+            return np.mean(audio, axis=1)
+    ...
+```
+
+#### 2. 从文件加载音频
+
+```python
+def _load_audio_from_path(self, audio_path: str) -&gt; np.ndarray:
+    import soundfile as sf
+    audio, sr = sf.read(audio_path, dtype='float32')
+    # 如果采样率不匹配，需要重采样
+    if sr != self.sampling_rate:
+        from librosa import resample
+        audio = resample(audio, orig_sr=sr, target_sr=self.sampling_rate)
+    return audio
+```
+
+#### 3. 单条音频处理
+
+```python
+def _process_single_audio(self, audio: np.ndarray) -&gt; np.ndarray:
+    # 确保单声道
+    audio = self._ensure_mono(audio)
+    # 归一化
+    if self.normalize_audio and self.normalizer:
+        audio = self.normalizer(audio)
+    return audio
+```
+
+## 五、VibeVoiceProcessor - 主处理器
+
+### 核心架构
+
+在 [`vibevoice/processor/vibevoice_processor.py`](file:///workspace/vibevoice/processor/vibevoice_processor.py) 中定义，是多说话人 TTS 的主要处理接口。
+
+### 初始化
+
+```python
+class VibeVoiceProcessor:
+    def __init__(self, tokenizer=None, audio_processor=None, 
+                 speech_tok_compress_ratio=3200, db_normalize=True):
+        self.tokenizer = tokenizer
+        self.audio_processor = audio_processor
+        self.speech_tok_compress_ratio = speech_tok_compress_ratio
+        self.db_normalize = db_normalize
+        self.audio_normalizer = AudioNormalizer() if db_normalize else None
+        self.system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
+```
+
+### 核心方法 - `_process_single`
+
+处理单个脚本输入：
+
+```python
+def _process_single(self, text: Union[str, TextInput], 
+                    voice_samples: Optional[List[Union[str, np.ndarray]]] = None):
+    # 1. 判断是文件路径还是直接的脚本内容
+    script = None
+    if isinstance(text, str):
+        if text.endswith('.json') and os.path.exists(text):
+            script = self._convert_json_to_script(text)
+        elif text.endswith('.txt') and os.path.exists(text):
+            script = self._convert_text_to_script(text)
+        else:
+            script = text
+    
+    # 2. 解析脚本
+    parsed_lines = self._parse_script(script)
+    all_speakers = list(set(speaker_id for speaker_id, _ in parsed_lines))
+    
+    # 3. 编码系统提示
+    system_tokens = self.tokenizer.encode(self.system_prompt)
+    
+    # 4. 处理语音样本
+    if voice_samples:
+        voice_tokens, voice_speech_inputs, voice_speech_masks = \
+            self._create_voice_prompt(voice_samples[:len(all_speakers)])
+    else:
+        voice_tokens, voice_speech_inputs, voice_speech_masks = [], [], []
+    
+    # 5. 构建完整的 Token 序列
+    full_tokens = system_tokens + voice_tokens
+    speech_input_mask = [False] * len(system_tokens) + voice_speech_masks
+    
+    # 6. 添加文本输入部分
+    full_tokens += self.tokenizer.encode(' Text input:\n', add_special_tokens=False)
+    speech_input_mask += [False] * len(...)
+    
+    # 7. 添加每个说话人的文本
+    for speaker_id, speaker_text in parsed_lines:
+        speaker_text_tokens = self.tokenizer.encode(
+            f" Speaker {speaker_id}:{speaker_text}\n", add_special_tokens=False
+        )
+        full_tokens += speaker_text_tokens
+        speech_input_mask += [False] * len(speaker_text_tokens)
+    
+    # 8. 添加语音输出部分
+    full_tokens += self.tokenizer.encode(' Speech output:\n', add_special_tokens=False) \
+                   + [self.tokenizer.speech_start_id]
+    speech_input_mask += [False] * (len(...) + 1)
+    
+    return {
+        "input_ids": full_tokens,
+        "speech_inputs": voice_speech_inputs if voice_speech_inputs else None,
+        "speech_input_mask": speech_input_mask,
+        "parsed_script": parsed_lines,
+        "all_speakers": all_speakers,
+    }
+```
+
+### 脚本构建流程
+
+```mermaid
+sequenceDiagram
+    participant User as 用户输入
+    participant Proc as VibeVoiceProcessor
+    participant Tokenizer as 文本分词器
+    participant AudioProc as 音频处理器
+    
+    User-&gt;&gt;Proc: 提交脚本 + 语音样本
+    Proc-&gt;&gt;Proc: _parse_script() 解析脚本
+    Proc-&gt;&gt;Tokenizer: encode(系统提示)
+    Proc-&gt;&gt;Proc: _create_voice_prompt()
+    loop 每个说话人样本
+        Proc-&gt;&gt;AudioProc: 加载/处理音频
+        AudioProc-&gt;&gt;Proc: 返回归一化音频
+        Proc-&gt;&gt;Proc: 计算token数量 = ceil(音频长度 / 3200)
+        Proc-&gt;&gt;Tokenizer: 构建语音占位符序列
+    end
+    Proc-&gt;&gt;Tokenizer: encode(文本输入部分)
+    Proc-&gt;&gt;Tokenizer: encode(语音输出部分)
+    Proc-&gt;&gt;User: 返回input_ids, speech_tensors, masks
+```
+
+### 语音提示构建 - `_create_voice_prompt`
+
+```python
+def _create_voice_prompt(self, speaker_samples: List[Union[str, np.ndarray]]):
+    vae_token_id = self.tokenizer.speech_diffusion_id
+    
+    voice_full_tokens = self.tokenizer.encode(' Voice input:\n', add_special_tokens=False)
+    voice_speech_inputs = []
+    voice_speech_masks = [False] * len(voice_full_tokens)
+    
+    for speaker_id, speaker_audio in enumerate(speaker_samples):
+        # 1. 加载音频
+        if isinstance(speaker_audio, str):
+            wav = self.audio_processor._load_audio_from_path(speaker_audio)
+        else:
+            wav = np.array(speaker_audio, dtype=np.float32)
+        
+        # 2. 归一化
+        if self.db_normalize and self.audio_normalizer:
+            wav = self.audio_normalizer(wav)
+        
+        # 3. 计算压缩后的 Token 数量
+        vae_tok_len = math.ceil(wav.shape[0] / self.speech_tok_compress_ratio)
+        
+        # 4. 构建 Token 序列
+        speaker_tokens = (
+            self.tokenizer.encode(f" Speaker {speaker_id}:", add_special_tokens=False) +
+            [self.tokenizer.speech_start_id] +
+            [vae_token_id] * vae_tok_len +
+            [self.tokenizer.speech_end_id] +
+            self.tokenizer.encode('\n', add_special_tokens=False)
+        )
+        
+        # 5. 构建掩码
+        vae_input_mask = (
+            [False] * len(prefix_tokens) +
+            [False] +
+            [True] * vae_tok_len +
+            [False] +
+            [False]
+        )
+        
+        voice_full_tokens.extend(speaker_tokens)
+        voice_speech_masks.extend(vae_input_mask)
+        voice_speech_inputs.append(wav)
+    
+    return voice_full_tokens, voice_speech_inputs, voice_speech_masks
+```
+
+### Token 序列结构示例
+
+对于一个有 2 个说话人的脚本，完整的 input_ids 结构如下：
+
+| 位置 | 内容 | 说明 |
+|-----|------|------|
+| 1~N | `[系统提示 token]` | 任务指导 |
+| N+1 | `[Voice input:\n token]` | 语音输入标记 |
+| ... | `[Speaker 0: token]` | 说话人 0 标记 |
+| ... | `[speech_start_id]` | 语音开始 |
+| ... | `[speech_diffusion_id] * M` | M个占位符（对应M帧音频） |
+| ... | `[speech_end_id]` | 语音结束 |
+| ... | `[Speaker 1: token]` | 说话人 1 标记 |
+| ... | `[speech_start_id]` | 语音开始 |
+| ... | `[speech_diffusion_id] * K` | K个占位符 |
+| ... | `[speech_end_id]` | 语音结束 |
+| ... | `[Text input:\n token]` | 文本输入标记 |
+| ... | `[说话人文本 token]` | 要合成的文本 |
+| ... | `[Speech output:\n token]` | 语音输出标记 |
+| ... | `[speech_start_id]` | 生成开始 |
+
+### 批量处理 - `_batch_encode`
+
+将多个处理结果合并为批量：
+
+```python
+def _batch_encode(self, encodings: List[Dict[str, Any]], ...):
+    # 1. 提取 input_ids
+    input_ids_list = [enc["input_ids"] for enc in encodings]
+    speech_input_masks_list = [enc["speech_input_mask"] for enc in encodings]
+    
+    # 2. Padding 到最长长度
+    if padding_strategy != PaddingStrategy.DO_NOT_PAD:
+        max_len = max(len(ids) for ids in input_ids_list)
+        padded_input_ids = []
+        attention_masks = []
+        padded_speech_input_masks = []
+        
+        for input_ids, speech_mask in zip(input_ids_list, speech_input_masks_list):
+            # Truncate
+            if truncation and len(input_ids) &gt; max_len:
+                input_ids = input_ids[:max_len]
+                speech_mask = speech_mask[:max_len]
+            
+            # Pad - 注意是向前padding!
+            padding_length = max_len - len(input_ids)
+            padded_ids = [self.tokenizer.pad_id] * padding_length + input_ids
+            attention_mask = [0] * padding_length + [1] * len(input_ids)
+            padded_speech_mask = [False] * padding_length + speech_mask
+            
+            padded_input_ids.append(padded_ids)
+            attention_masks.append(attention_mask)
+            padded_speech_input_masks.append(padded_speech_mask)
+    
+    # 3. 处理语音张量
+    if has_speech:
+        speech_dict = self.prepare_speech_inputs(all_speech_inputs, return_tensors=...)
+        batch_encoding["speech_tensors"] = speech_dict["padded_speeches"]
+        batch_encoding["speech_masks"] = speech_dict["speech_masks"]
+    
+    return batch_encoding
+```
+
+### 从预训练加载
+
+```python
+@classmethod
+def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+    # 1. 加载配置
+    config_path = os.path.join(pretrained_model_name_or_path, "preprocessor_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+    
+    # 2. 加载文本分词器
+    if 'qwen' in language_model_pretrained_name.lower():
+        tokenizer = VibeVoiceTextTokenizerFast.from_pretrained(...)
+    
+    # 3. 加载音频处理器
+    audio_processor = VibeVoiceTokenizerProcessor(...)
+    
+    return cls(tokenizer=tokenizer, audio_processor=audio_processor, ...)
+```
+
+## 六、其他处理器
+
+### VibeVoiceStreamingProcessor - 流式处理器
+
+在 [`vibevoice/processor/vibevoice_streaming_processor.py`](file:///workspace/vibevoice/processor/vibevoice_streaming_processor.py) 中定义，专为 0.5B 流式模型设计，使用预计算的语音嵌入（.pt 文件）。
+
+### VibeVoiceASRProcessor - ASR 处理器
+
+在 [`vibevoice/processor/vibevoice_asr_processor.py`](file:///workspace/vibevoice/processor/vibevoice_asr_processor.py) 中定义，专门处理 ASR 任务的输入。
+
+## 七、完整使用示例
+
+### 示例 1：多说话人 TTS 推理
+
+```python
+from vibevoice.processor import VibeVoiceProcessor
+from vibevoice.modular import VibeVoiceForConditionalGeneration
+
+# 1. 加载处理器和模型
+processor = VibeVoiceProcessor.from_pretrained("path/to/model")
+model = VibeVoiceForConditionalGeneration.from_pretrained("path/to/model")
+
+# 2. 准备脚本和语音样本
+script = """
+Speaker 0: 你好，很高兴认识你！
+Speaker 1: 我也是！很高兴见到你。
+"""
+
+voice_samples = [
+    "path/to/speaker0_voice.wav",
+    "path/to/speaker1_voice.wav"
+]
+
+# 3. 处理输入
+inputs = processor(
+    text=script,
+    voice_samples=voice_samples,
+    return_tensors="pt"
+)
+
+# 4. 推理
+with torch.no_grad():
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=1000,
+        cfg_scale=3.0
+    )
+
+# 5. 保存音频
+processor.save_audio(outputs.speech_outputs[0], "output.wav")
+```
+
+### 示例 2：从 JSON 文件加载
+
+```python
+# JSON 格式示例:
+# [
+#   {"speaker": "1", "text": "Hello everyone..."},
+#   {"speaker": "2", "text": "Great to be here..."}
+# ]
+
+inputs = processor(
+    text="path/to/script.json",
+    voice_samples=voice_samples
+)
+```
+
+### 示例 3：批量处理
+
+```python
+scripts = [
+    "Speaker 0: 你好\nSpeaker 1: 嗨",
+    "Speaker 0: 谢谢\nSpeaker 1: 不客气"
+]
+
+all_voice_samples = [
+    ["voice0a.wav", "voice1a.wav"],
+    ["voice0b.wav", "voice1b.wav"]
+]
+
+inputs = processor(
+    text=scripts,
+    voice_samples=all_voice_samples,
+    return_tensors="pt"
+)
+```
+
+## 八、关键设计要点
+
+### 1. 压缩比计算
+
+`speech_tok_compress_ratio = 3200` 意味着：
+- 24kHz 采样率
+- 每 3200 个样本压缩为 1 帧 VAE 隐变量
+- 帧率 = 24000 / 3200 = 7.5 FPS
+
+### 2. 向前 Padding
+
+在 `_batch_encode` 中采用向前 padding（在序列前面补 pad），这样可以：
+- 保持语音生成部分的连续性
+- 让 attention mask 更有意义
+
+### 3. 语音输入掩码
+
+`speech_input_mask` 是一个布尔数组，标记哪些位置是语音占位符，这些位置会被 VAE 编码后的隐向量替换。
+
+### 4. 分贝归一化
+
+`target_dB_FS = -25` 是一个平衡的选择，既不会太轻也不会太重，同时 `avoid_clipping` 确保不会超出 [-1, 1] 范围。
